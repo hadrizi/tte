@@ -1,3 +1,7 @@
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -7,8 +11,12 @@
 #include <sys/ioctl.h>
 #include <assert.h>
 #include <string.h>
+#include <sys/types.h>
+#include <time.h>
+#include <stdarg.h>
 
 #define TTE_VERSION "0.0.1"
+#define TTE_TAB_STOP 4
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define ESC_SEQ(cmd) "\x1b["cmd
@@ -26,15 +34,30 @@ typedef enum {
 } EditorKey;
  
 typedef struct {
+    size_t size;
+    size_t rsize;
+    char *chars;
+    char *render;
+} EditorRow;
+
+typedef struct {
     int cx, cy;
+    int rcx; // render cursor
+    int row_offset;
     int screenrows, screencols;
+    int numrows;
+    EditorRow *rows;
     struct termios orig_ts;
+    char *filename;
+    char statusmsg[80];
+    time_t statusmsg_time;
 } EditorConfig;
 
 typedef struct {
     char *b;
-    size_t len;
+    ssize_t len;
 } AppendBuf;
+
 
 EditorConfig cfg;
 
@@ -86,10 +109,22 @@ void enter_raw_mode() {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &tte_ts);
 }
 
+int editor_cx_to_rcx(EditorRow *row, int cx) {
+    int rcx = 0;
+    for (int i = 0; i < cx; i++) {
+        if (row->chars[i] == '\t')
+            rcx += (TTE_TAB_STOP - 1) - (rcx % TTE_TAB_STOP);
+        rcx++;
+    }
+
+    return rcx;
+}
+
 void editor_draw_rows(AppendBuf *ab) {
     int y;
     for(y = 0; y < cfg.screenrows; y++){
-        if (y == cfg.screenrows / 3) {
+        int _y = y + cfg.row_offset;
+        if (_y == cfg.screenrows / 3 && cfg.numrows == 0) {
             char splash[256];
             int splashlen = snprintf(splash, sizeof(splash), "T text editor -- version %s", TTE_VERSION);
 
@@ -98,30 +133,85 @@ void editor_draw_rows(AppendBuf *ab) {
             while (padding--) ab_append(ab, " ");
             
             ab_append(ab, splash);
-        } else ab_append(ab, "~");
+        }
+        else if (_y < cfg.numrows && cfg.numrows != 0) ab_append(ab, cfg.rows[_y].render);
+        else ab_append(ab, "~");
 
         ab_append(ab, ESC_SEQ("K"));
-        if (y < cfg.screenrows - 1) {
-            ab_append(ab, "\r\n");;
-        }
+        ab_append(ab, "\r\n");;
     };
 }
 
+void editor_draw_status_bar(AppendBuf *ab) {
+    ab_append(ab, ESC_SEQ("7m"));
+
+    char lstatus[80], rstatus[80];
+    int llen = snprintf(
+        lstatus,
+        sizeof(lstatus),
+        " %.20s - %d lines",
+        cfg.filename ? cfg.filename : "[No File]", cfg.numrows
+    );
+    int rlen = snprintf(
+        rstatus,
+        sizeof(rstatus),
+        "%d/%d ",
+        cfg.cy + 1, cfg.numrows
+    );
+
+    ab_append(ab, lstatus);
+    while (llen < cfg.screencols) {
+        if (cfg.screencols - llen == rlen) {
+            ab_append(ab, rstatus);
+            break;
+        }
+
+        ab_append(ab, " ");
+        llen++;
+    }
+    
+    ab_append(ab, ESC_SEQ("m"));
+    ab_append(ab, "\r\n");
+}
+
+void editor_draw_message_bar(AppendBuf *ab) {
+    ab_append(ab, ESC_SEQ("K"));
+    if (strlen(cfg.statusmsg) && time(NULL) - cfg.statusmsg_time < 5) ab_append(ab, cfg.statusmsg);
+}
+
+void editor_scroll() {
+    if (cfg.cy < cfg.row_offset) cfg.row_offset = cfg.cy;
+    if (cfg.cy >= cfg.row_offset + cfg.screenrows) cfg.row_offset = cfg.cy - cfg.screenrows + 1;
+}
+
 void editor_refresh_screen() {
+    if (cfg.cy < cfg.numrows) cfg.rcx = editor_cx_to_rcx(&cfg.rows[cfg.cy], cfg.cx);
+    editor_scroll();
+
     AppendBuf buf = {0};
 
     ab_append(&buf, ESC_SEQ("?25l"));
     ab_append(&buf, ESC_SEQ("H"));
 
     editor_draw_rows(&buf);
+    editor_draw_status_bar(&buf);
+    editor_draw_message_bar(&buf);
 
     char cmdbuf[32];
-    snprintf(cmdbuf, sizeof(buf), ESC_SEQ("%d;%dH"), cfg.cy + 1, cfg.cx + 1);
+    snprintf(cmdbuf, sizeof(buf), ESC_SEQ("%d;%dH"), cfg.cy - cfg.row_offset + 1, cfg.rcx + 1);
     ab_append(&buf, cmdbuf);
 
     ab_append(&buf, ESC_SEQ("?25h"));
 
     write(STDOUT_FILENO, buf.b, buf.len);
+}
+
+void editor_set_status_message(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cfg.statusmsg, sizeof(cfg.statusmsg), fmt, ap);
+    va_end(ap);
+    cfg.statusmsg_time = time(NULL);
 }
 
 int editor_read_key() {
@@ -193,10 +283,23 @@ void editor_move_cursor(int k) {
         break;
     }
 
+
+    if (cfg.cx < 0 && cfg.cy > 0) {
+        cfg.cy--;
+        cfg.cx = cfg.rows[cfg.cy].size;
+    }
+
+    EditorRow *row = (cfg.cy >= cfg.numrows) ? NULL : &cfg.rows[cfg.cy];
+    int rowlen = row ? row->size : 0;
+    if (cfg.cx > rowlen && cfg.cy < cfg.numrows) {
+        cfg.cy++;
+        cfg.cx = 0;
+    }
+    
     if (cfg.cx < 0) cfg.cx = 0;
     if (cfg.cy < 0) cfg.cy = 0;
-    if (cfg.cx > cfg.screencols - 1) cfg.cx = cfg.screencols - 1;
-    if (cfg.cy > cfg.screenrows - 1) cfg.cy = cfg.screenrows - 1;
+    if (cfg.cx > rowlen) cfg.cx = rowlen;
+    if (cfg.cy > cfg.numrows) cfg.cy = cfg.numrows;
 }
 
 void editor_process_keypress() {
@@ -217,13 +320,19 @@ void editor_process_keypress() {
         break;
     case PAGE_DOWN:
     case PAGE_UP:
-        cfg.cy = c == PAGE_UP ? 0 : cfg.screenrows - 1;
+        if (c == PAGE_UP) cfg.cy = cfg.row_offset;
+        if (c == PAGE_DOWN) cfg.cy = cfg.row_offset + cfg.screenrows - 1;
+
+        int t = cfg.screenrows;
+        while (t--) {
+            editor_move_cursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+        }
         break;
     case HOME_KEY:
         cfg.cx = 0;
         break;
     case END_KEY:
-        cfg.cx = cfg.screencols - 1;
+        if (cfg.cy < cfg.numrows) cfg.cx = cfg.rows[cfg.cy].size;
         break;
     }
 }
@@ -261,16 +370,91 @@ void get_win_size(int *rows, int *cols) {
 void editor_init() {
     cfg.cx = 0;
     cfg.cy = 0;
+    cfg.rcx = cfg.cx;
+    cfg.numrows = 0;
+    cfg.row_offset = 0;
+    cfg.rows = NULL;
+    cfg.filename = NULL;
+    cfg.statusmsg[0] = '\0';
+    cfg.statusmsg_time = 0;
+    
     get_win_size(&cfg.screenrows, &cfg.screencols);
+    cfg.screenrows -= 2;
 }
 
-int main() {
+void editor_render_row(EditorRow *row) {
+    int tabs = 0;
+    for (size_t i = 0; i < row->size; i++) if (row->chars[i] == '\t') tabs++;
+
+    free(row->render);
+    row->render = malloc(row->size + tabs * (TTE_TAB_STOP - 1) + 1);
+
+    int rsize = 0;
+    for (size_t i = 0; i < row->size; i++) {
+        if (row->chars[i] != '\t') {
+            row->render[rsize++] = row->chars[i];
+            continue;
+        }
+
+        row->render[rsize++] = ' ';
+        while(rsize % TTE_TAB_STOP != 0) row->render[rsize++] = ' ';
+    }
+    row->render[rsize] = '\0';
+    row->rsize = rsize;
+}
+
+void editor_append_row(char *s, size_t len) {
+    cfg.rows = realloc(cfg.rows, sizeof(EditorRow) * (cfg.numrows + 1));
+
+    int at = cfg.numrows;
+    cfg.rows[at].size = len;
+    cfg.rows[at].chars = malloc(len + 1);
+    memcpy(cfg.rows[at].chars, s, len);
+    cfg.rows[at].chars[len] = '\0';
+
+    cfg.rows[at].rsize = 0;
+    cfg.rows[at].render = NULL;
+    editor_render_row(&cfg.rows[at]);
+
+    cfg.numrows++;
+}
+
+void editor_open(char *filename) {
+    free(cfg.filename);
+    cfg.filename = strdup(filename);
+
+    FILE *fp = fopen(filename, "r");
+    if (!fp) die("editor_open");
+    
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+
+    while((linelen = getline(&line, &linecap, fp)) != -1){
+        while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) linelen--;
+        editor_append_row(line, linelen);
+    }
+
+    free(line);
+    fclose(fp);
+}
+
+int main(int argc, char *argv[]) {
     enter_raw_mode();
     editor_init();
 
+    if (argc >= 2) {
+        editor_open(argv[1]);
+    }
+
+    editor_set_status_message("HELP: Ctrl-Q = quit");
     while (1) {
         editor_refresh_screen();
         editor_process_keypress();
     }
+
+    for (int i = 0; i < cfg.numrows; i++) { free(cfg.rows[i].chars); free(cfg.rows[i].render); };
+    free(cfg.rows);
+    free(cfg.filename);
     return 0;
 }
