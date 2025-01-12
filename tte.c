@@ -14,14 +14,18 @@
 #include <sys/types.h>
 #include <time.h>
 #include <stdarg.h>
+#include <fcntl.h>
+#include <stdbool.h>
 
 #define TTE_VERSION "0.0.1"
 #define TTE_TAB_STOP 4
+#define TTE_UNSAVED_QUIT_ATTEMTPS 1
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define ESC_SEQ(cmd) "\x1b["cmd
 
 typedef enum {
+    BACKSPACE = 127,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -51,13 +55,13 @@ typedef struct {
     char *filename;
     char statusmsg[80];
     time_t statusmsg_time;
+    int dirty;
 } EditorConfig;
 
 typedef struct {
     char *b;
     ssize_t len;
 } AppendBuf;
-
 
 EditorConfig cfg;
 
@@ -149,8 +153,8 @@ void editor_draw_status_bar(AppendBuf *ab) {
     int llen = snprintf(
         lstatus,
         sizeof(lstatus),
-        " %.20s - %d lines",
-        cfg.filename ? cfg.filename : "[No File]", cfg.numrows
+        " %.20s - %d lines %s",
+        cfg.filename ? cfg.filename : "[No File]", cfg.numrows, cfg.dirty ? "(modified)" : ""
     );
     int rlen = snprintf(
         rstatus,
@@ -204,6 +208,8 @@ void editor_refresh_screen() {
     ab_append(&buf, ESC_SEQ("?25h"));
 
     write(STDOUT_FILENO, buf.b, buf.len);
+
+    ab_free(&buf);
 }
 
 void editor_set_status_message(const char *fmt, ...) {
@@ -302,12 +308,187 @@ void editor_move_cursor(int k) {
     if (cfg.cy > cfg.numrows) cfg.cy = cfg.numrows;
 }
 
+void editor_render_row(EditorRow *row) {
+    int tabs = 0;
+    for (size_t i = 0; i < row->size; i++) if (row->chars[i] == '\t') tabs++;
+
+    free(row->render);
+    row->render = malloc(row->size + tabs * (TTE_TAB_STOP - 1) + 1);
+
+    int rsize = 0;
+    for (size_t i = 0; i < row->size; i++) {
+        if (row->chars[i] != '\t') {
+            row->render[rsize++] = row->chars[i];
+            continue;
+        }
+
+        row->render[rsize++] = ' ';
+        while(rsize % TTE_TAB_STOP != 0) row->render[rsize++] = ' ';
+    }
+    row->render[rsize] = '\0';
+    row->rsize = rsize;
+}
+
+void editor_insert_row(int at, char *s, size_t len) {
+    if (at > cfg.numrows) return;
+
+    cfg.rows = realloc(cfg.rows, sizeof(EditorRow) * (cfg.numrows + 1));
+    memmove(&cfg.rows[at + 1], &cfg.rows[at], sizeof(EditorRow) * (cfg.numrows - at));
+
+    cfg.rows = realloc(cfg.rows, sizeof(EditorRow) * (cfg.numrows + 1));
+
+    cfg.rows[at].size = len;
+    cfg.rows[at].chars = malloc(len + 1);
+    memcpy(cfg.rows[at].chars, s, len);
+    cfg.rows[at].chars[len] = '\0';
+
+    cfg.rows[at].rsize = 0;
+    cfg.rows[at].render = NULL;
+    editor_render_row(&cfg.rows[at]);
+
+    cfg.numrows++;
+    cfg.dirty++;
+}
+
+void editor_insert_new_line() {
+    if (cfg.cx == 0) editor_insert_row(cfg.cy, "", 0);
+    else {
+        EditorRow *cur_row = &cfg.rows[cfg.cy];
+        editor_insert_row(cfg.cy + 1, &cur_row->chars[cfg.cx], cur_row->size - cfg.cx);
+        
+        cur_row = &cfg.rows[cfg.cy];
+        cur_row->size = cfg.cx;
+        cur_row->chars[cur_row->size] = '\0';
+        editor_render_row(cur_row);
+    }
+    cfg.cy++;
+    cfg.cx = 0;
+}
+
+void editor_row_free(EditorRow *row) {
+    free(row->render);
+    free(row->chars);
+}
+
+void editor_del_row(int at) {
+    if (at >= cfg.numrows) return;
+    editor_row_free(&cfg.rows[at]);
+    memmove(&cfg.rows[at], &cfg.rows[at + 1], sizeof(EditorRow) * (cfg.numrows - at - 1));
+    cfg.numrows--;
+    cfg.dirty++;
+}
+
+void editor_row_append_string(EditorRow *row, char *s) {
+    size_t len = strlen(s);
+    row->chars = realloc(row->chars, row->size + len + 1);
+    memcpy(&row->chars[row->size], s, len);
+    row->size += len;
+    row->chars[row->size] = '\0';
+    editor_render_row(row);
+    cfg.dirty++;
+}
+
+void editor_row_insert_char(EditorRow *row, size_t at, int c) {
+    if (at > row->size) at = row->size;
+    row->chars = realloc(row->chars, row->size + 2);
+
+    memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+    row->size++;
+    row->chars[at] = c;
+    editor_render_row(row);
+
+    cfg.dirty++;
+}
+
+void editor_insert_char(int c) {
+    if (cfg.cy == cfg.numrows) editor_insert_row(cfg.numrows, "", 0);
+    editor_row_insert_char(&cfg.rows[cfg.cy], cfg.cx, c);
+    cfg.cx++;
+}
+
+void editor_row_del_char(EditorRow *row, size_t at) {
+    if (at >= row->size) return;
+    memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+    row->size--;
+    editor_render_row(row);
+    cfg.dirty++;
+}
+
+void editor_del_char() {
+    if (cfg.cy == cfg.numrows) return;
+    if (cfg.cx == 0 && cfg.cy == 0) return;
+
+    EditorRow *cur_row = &cfg.rows[cfg.cy];
+    if (cfg.cx > 0) {
+        editor_row_del_char(cur_row, cfg.cx - 1);
+        cfg.cx--;
+    } else {
+        cfg.cx = cfg.rows[cfg.cy - 1].size;
+        editor_row_append_string(&cfg.rows[cfg.cy - 1], cur_row->chars);
+        editor_del_row(cfg.cy);
+        cfg.cy--;
+    }
+}
+
+char *editor_get_rows_as_str(size_t *buflen) {
+    size_t len = 0;
+    for (int i = 0; i < cfg.numrows; i++) len += cfg.rows[i].size + 1;
+    *buflen = len;
+
+    char *buf = malloc(len);
+    char *p = buf;
+
+    for(int i = 0; i < cfg.numrows; i++) {
+        memcpy(p, cfg.rows[i].chars, cfg.rows[i].size);
+        p += cfg.rows[i].size;
+        *p = '\n';
+        p++;
+    }
+
+    return buf;
+}
+
+void editor_save() {
+    if (!cfg.filename) return;
+
+    size_t len;
+    char *buf = editor_get_rows_as_str(&len);
+
+    int fd = open(cfg.filename, O_RDWR | O_CREAT, 0644);
+    if (fd == -1) {
+        editor_set_status_message("Can't save! I/O error: %s", strerror(errno));
+        goto editor_save_end;
+    }
+    if (ftruncate(fd, len) == -1) {
+        editor_set_status_message("Can't save! I/O error: %s", strerror(errno));
+        goto editor_save_end;
+    }
+    
+    ssize_t written_len = write(fd, buf, len);
+    editor_set_status_message("%d bytes written to disk", written_len);
+
+    cfg.dirty = 0;
+
+editor_save_end:
+    close(fd);
+    free(buf);
+}
+
 void editor_process_keypress() {
+    static int unsaved_quit_attempts = TTE_UNSAVED_QUIT_ATTEMTPS;
     int c = editor_read_key();
 
     switch (c)
     {
+    case '\r':
+      editor_insert_new_line();
+      break;
     case CTRL_KEY('q'):
+        if (cfg.dirty && unsaved_quit_attempts) {
+            editor_set_status_message("File has unsaved changes. Press Ctrl-Q %d more times to quit", unsaved_quit_attempts);
+            unsaved_quit_attempts--;
+            return;
+        }
         write(STDOUT_FILENO, ESC_SEQ("2J"), 4);
         write(STDOUT_FILENO, ESC_SEQ("H"), 3);
         exit(0);
@@ -334,7 +515,24 @@ void editor_process_keypress() {
     case END_KEY:
         if (cfg.cy < cfg.numrows) cfg.cx = cfg.rows[cfg.cy].size;
         break;
+    case BACKSPACE:
+    case CTRL_KEY('h'):
+    case DEL_KEY:
+      if (c == DEL_KEY) editor_move_cursor(ARROW_RIGHT);
+      editor_del_char();
+      break;
+    case CTRL_KEY('l'):
+    case '\x1b':
+      break;
+    case CTRL_KEY('s'):
+        editor_save();
+        break;
+    default:
+        editor_insert_char(c);
+        break;
     }
+
+    unsaved_quit_attempts = TTE_UNSAVED_QUIT_ATTEMTPS;
 }
 
 void get_cursor_pos(int *rows, int *cols) {
@@ -377,46 +575,10 @@ void editor_init() {
     cfg.filename = NULL;
     cfg.statusmsg[0] = '\0';
     cfg.statusmsg_time = 0;
+    cfg.dirty = 0;
     
     get_win_size(&cfg.screenrows, &cfg.screencols);
     cfg.screenrows -= 2;
-}
-
-void editor_render_row(EditorRow *row) {
-    int tabs = 0;
-    for (size_t i = 0; i < row->size; i++) if (row->chars[i] == '\t') tabs++;
-
-    free(row->render);
-    row->render = malloc(row->size + tabs * (TTE_TAB_STOP - 1) + 1);
-
-    int rsize = 0;
-    for (size_t i = 0; i < row->size; i++) {
-        if (row->chars[i] != '\t') {
-            row->render[rsize++] = row->chars[i];
-            continue;
-        }
-
-        row->render[rsize++] = ' ';
-        while(rsize % TTE_TAB_STOP != 0) row->render[rsize++] = ' ';
-    }
-    row->render[rsize] = '\0';
-    row->rsize = rsize;
-}
-
-void editor_append_row(char *s, size_t len) {
-    cfg.rows = realloc(cfg.rows, sizeof(EditorRow) * (cfg.numrows + 1));
-
-    int at = cfg.numrows;
-    cfg.rows[at].size = len;
-    cfg.rows[at].chars = malloc(len + 1);
-    memcpy(cfg.rows[at].chars, s, len);
-    cfg.rows[at].chars[len] = '\0';
-
-    cfg.rows[at].rsize = 0;
-    cfg.rows[at].render = NULL;
-    editor_render_row(&cfg.rows[at]);
-
-    cfg.numrows++;
 }
 
 void editor_open(char *filename) {
@@ -432,8 +594,10 @@ void editor_open(char *filename) {
 
     while((linelen = getline(&line, &linecap, fp)) != -1){
         while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) linelen--;
-        editor_append_row(line, linelen);
+        editor_insert_row(cfg.numrows, line, linelen);
     }
+
+    cfg.dirty = 0;
 
     free(line);
     fclose(fp);
@@ -447,7 +611,7 @@ int main(int argc, char *argv[]) {
         editor_open(argv[1]);
     }
 
-    editor_set_status_message("HELP: Ctrl-Q = quit");
+    editor_set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit");
     while (1) {
         editor_refresh_screen();
         editor_process_keypress();
