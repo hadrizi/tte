@@ -8,3 +8,4 @@ At its current state it's just a framework of a text editor based on [kilo](http
 - https://wiki.xxiivv.com/site/varvara.html - ergonomic "computer system" that inspired the project
 - https://github.com/antirez/kilo - small and simple text editor in C on which tte's backend is based
 - https://en.wikipedia.org/wiki/Zilog_Z80 - old CPU on the basis of which tte's VM assembly is being designed
+- https://github.com/hadrizi/lcl - my old language, stack-oriented design of which is being used for tte's VM architecture
